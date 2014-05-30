@@ -98,6 +98,8 @@ type PushImageOptions struct {
 	// Registry server to push the image
 	Registry string
 
+	Tag string `qs:"tag"`
+
 	OutputStream io.Writer `qs:"-"`
 }
 
