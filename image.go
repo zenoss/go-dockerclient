@@ -141,6 +141,7 @@ type PullImageOptions struct {
 	Repository   string `qs:"fromImage"`
 	Registry     string
 	OutputStream io.Writer `qs:"-"`
+	Tag          string    `qs:"tag"`
 }
 
 // PullImage pulls an image from a remote registry, logging progress to w.
