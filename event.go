@@ -298,8 +298,10 @@ func (s *Subscription) run() error {
 		for {
 			select {
 			case e := <-s.eventChannel:
-				if h, ok := s.handlers[e["status"].(string)]; ok {
-					h(e)
+				if e["status"] != nil {
+					if h, ok := s.handlers[e["status"].(string)]; ok {
+						h(e)
+					}
 				}
 			case crc := <-s.cancelChannel:
 				crc <- struct{}{}
