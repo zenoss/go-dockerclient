@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	DockerEndpoint = "http://127.0.0.1:3006"
+	DockerEndpoint = "unix:///var/run/docker.sock"
 )
 
 func TestMonitorEvents(t *testing.T) {
