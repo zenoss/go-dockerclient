@@ -1,374 +1,93 @@
+// Copyright 2014 go-dockerclient authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package docker
 
 import (
-	"sync"
+	"bufio"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
-
-	"github.com/dotcloud/docker/utils"
 )
 
-const (
-	DockerEndpoint = "http://127.0.0.1:3006"
-)
+func TestEventListeners(t *testing.T) {
+	response := `{"status":"create","id":"dfdf82bd3881","from":"base:latest","time":1374067924}
+{"status":"start","id":"dfdf82bd3881","from":"base:latest","time":1374067924}
+{"status":"stop","id":"dfdf82bd3881","from":"base:latest","time":1374067966}
+{"status":"destroy","id":"dfdf82bd3881","from":"base:latest","time":1374067970}
+`
 
-func TestMonitorEvents(t *testing.T) {
-	dc, err := NewClient(DockerEndpoint)
-	if err != nil {
-		t.Fatalf("can't create docker client: %v", err)
-	}
-
-	em, err := dc.MonitorEvents()
-	if err != nil {
-		t.Fatalf("can't create event monitor: %v", err)
-	}
-
-	if !em.IsActive() {
-		t.Fatal("event monitor is inactive")
-	}
-
-	err = em.Close()
-	if err != nil {
-		t.Fatalf("can't close event monitor")
-	}
-
-	if em.IsActive() {
-		t.Fatal("event monitor is active")
-	}
-}
-
-func TestUnknownEventHandler(t *testing.T) {
-	dc, err := NewClient(DockerEndpoint)
-	if err != nil {
-		t.Fatalf("can't create docker client: %v", err)
-	}
-
-	em, err := dc.MonitorEvents()
-	if err != nil {
-		t.Fatalf("can't create event monitor: %v", err)
-	}
-
-	s, err := em.Subscribe(AllThingsDocker)
-	if err != nil {
-		t.Fatalf("universal subscription failed: %f", err)
-	}
-
-	err = s.Handle("BooYa!", func(e Event) error {
-		return nil
-	})
-	if err == nil {
-		t.Fatal("expecting unknown event error")
-	}
-
-	em.Close()
-}
-
-func TestUniversalEventSubscription(t *testing.T) {
-	dc, err := NewClient(DockerEndpoint)
-	if err != nil {
-		t.Fatalf("can't create docker client: %v", err)
-	}
-
-	em, err := dc.MonitorEvents()
-	if err != nil {
-		t.Fatalf("can't create event monitor: %v", err)
-	}
-
-	s, err := em.Subscribe(AllThingsDocker)
-	if err != nil {
-		t.Fatalf("universal subscription failed: %f", err)
-	}
-
-	cc := make(chan string)
-	s.Handle(Create, func(e Event) error {
-		cc <- e["status"].(string)
-		return nil
-	})
-	s.Handle(Destroy, func(e Event) error {
-		utils.Debugf("handling destruction")
-		cc <- e["status"].(string)
-		return nil
-	})
-
-	c, err := dc.CreateContainer(CreateContainerOptions{"", &Config{
-		Image:        "ubuntu",
-		Cmd:          []string{"/bin/bash"},
-		AttachStdout: true,
-	}})
-	if err != nil {
-		t.Fatalf("couldn't create test container: %v", err)
-	}
-
-	to := time.After(10 * time.Second)
-	select {
-	case <-cc:
-		t.Log("container created")
-	case <-to:
-		t.Fatal("container creation timed out")
-	}
-
-	err = dc.RemoveContainer(RemoveContainerOptions{ID: c.ID})
-	if err != nil {
-		t.Fatalf("unable to remove container %s: %v", c.ID, err)
-	}
-
-	to = time.After(10 * time.Second)
-	select {
-	case <-cc:
-		t.Log("container removed")
-	case <-to:
-		t.Fatal("container removal timed out")
-	}
-
-	err = s.Cancel()
-	if err != nil {
-		t.Fatal("can't close subscription: %v", err)
-	}
-
-	err = em.Close()
-	if err != nil {
-		t.Fatal("can't close event monitor: %v", err)
-	}
-}
-
-func TestContainerEventSubscription(t *testing.T) {
-	dc, err := NewClient(DockerEndpoint)
-	if err != nil {
-		t.Fatalf("can't create docker client: %v", err)
-	}
-
-	em, err := dc.MonitorEvents()
-	if err != nil {
-		t.Fatalf("can't create event monitor: %v", err)
-	}
-
-	c, err := dc.CreateContainer(CreateContainerOptions{"", &Config{
-		Image: "ubuntu",
-		Cmd:   []string{"/bin/bash"},
-	}})
-	if err != nil {
-		t.Fatalf("couldn't create test container: %v", err)
-	}
-
-	s, err := em.Subscribe(c.ID)
-	if err != nil {
-		t.Fatalf("subscription to container %v failed: %v", c.ID, err)
-	}
-
-	cc := make(chan string)
-
-	s.Handle(Start, func(e Event) error {
-		cc <- e["status"].(string)
-		return nil
-	})
-	s.Handle(Stop, func(e Event) error {
-		cc <- e["status"].(string)
-		return nil
-	})
-	s.Handle(Die, func(e Event) error {
-		cc <- e["status"].(string)
-		return nil
-	})
-
-	err = dc.StartContainer(c.ID, &HostConfig{})
-	if err != nil {
-		t.Fatalf("couldn't start test container: %v", err)
-	}
-
-	to := time.After(10 * time.Second)
-	select {
-	case <-cc:
-		t.Log("test container started")
-	case <-to:
-		t.Fatal("start test container timed out")
-	}
-
-	to = time.After(10 * time.Second)
-	select {
-	case <-cc:
-		t.Log("test container died")
-	case <-to:
-		t.Fatal("timed out waiting for container to die")
-	}
-
-	err = dc.StopContainer(c.ID, 10)
-	if err != nil {
-		t.Fatalf("couldn't stop test container: %v", err)
-	}
-
-	to = time.After(10 * time.Second)
-	select {
-	case <-cc:
-		t.Log("test container stopped")
-	case <-to:
-		t.Fatal("stop test container timed out")
-	}
-
-	err = dc.RemoveContainer(RemoveContainerOptions{ID: c.ID})
-	if err != nil {
-		t.Fatalf("unable to remove container %s: %v", c.ID, err)
-	}
-
-	err = em.Close()
-	if err != nil {
-		t.Fatalf("can't close event monitor: %v", err)
-	}
-}
-
-func TestCombinedEventSubscription(t *testing.T) {
-	dc, err := NewClient(DockerEndpoint)
-	if err != nil {
-		t.Fatalf("can't create docker client: %v", err)
-	}
-
-	em, err := dc.MonitorEvents()
-	if err != nil {
-		t.Fatalf("can't create event monitor: %v", err)
-	}
-
-	sa, err := em.Subscribe(AllThingsDocker)
-	if err != nil {
-		t.Fatalf("universal subscription failed: %f", err)
-	}
-
-	sac := make(chan string)
-	sa.Handle(Create, func(e Event) error {
-		sac <- e["status"].(string)
-		return nil
-	})
-	sa.Handle(Destroy, func(e Event) error {
-		utils.Debugf("handling destruction")
-		sac <- e["status"].(string)
-		return nil
-	})
-
-	c, err := dc.CreateContainer(CreateContainerOptions{"", &Config{
-		Image: "ubuntu",
-		Cmd:   []string{"/bin/bash"},
-	}})
-	if err != nil {
-		t.Fatalf("couldn't create test container: %v", err)
-	}
-
-	to := time.After(10 * time.Second)
-	select {
-	case <-sac:
-		t.Log("container created")
-	case <-to:
-		t.Fatal("container creation timed out")
-	}
-
-	s, err := em.Subscribe(c.ID)
-	if err != nil {
-		t.Fatalf("subscription to container %v failed: %v", c.ID, err)
-	}
-
-	cc := make(chan string)
-
-	s.Handle(Start, func(e Event) error {
-		cc <- e["status"].(string)
-		return nil
-	})
-	s.Handle(Stop, func(e Event) error {
-		cc <- e["status"].(string)
-		return nil
-	})
-	s.Handle(Die, func(e Event) error {
-		cc <- e["status"].(string)
-		return nil
-	})
-
-	err = dc.StartContainer(c.ID, &HostConfig{})
-	if err != nil {
-		t.Fatalf("couldn't start test container: %v", err)
-	}
-
-	to = time.After(10 * time.Second)
-	select {
-	case <-cc:
-		t.Log("test container started")
-	case <-to:
-		t.Fatal("start test container timed out")
-	}
-
-	to = time.After(10 * time.Second)
-	select {
-	case <-cc:
-		t.Log("test container died")
-	case <-to:
-		t.Fatal("timed out waiting for container to die")
-	}
-
-	err = dc.StopContainer(c.ID, 10)
-	if err != nil {
-		t.Fatalf("couldn't stop test container: %v", err)
-	}
-
-	to = time.After(10 * time.Second)
-	select {
-	case <-cc:
-		t.Log("test container stopped")
-	case <-to:
-		t.Fatal("stop test container timed out")
-	}
-
-	err = dc.RemoveContainer(RemoveContainerOptions{ID: c.ID})
-	if err != nil {
-		t.Fatalf("unable to remove container %s: %v", c.ID, err)
-	}
-
-	err = em.Close()
-	if err != nil {
-		t.Fatalf("can't close event monitor: %v", err)
-	}
-}
-
-func TestEventMonitorSubscriptionCancelation(t *testing.T) {
-	dc, err := NewClient(DockerEndpoint)
-	if err != nil {
-		t.Fatalf("can't create docker client: %v", err)
-	}
-
-	em, err := dc.MonitorEvents()
-	if err != nil {
-		t.Fatalf("can't create event monitor: %v", err)
-	}
-
-	var wg sync.WaitGroup
-
-	subscriptions := []*Subscription{}
-	for _, n := range []int{1, 2, 3, 4, 5} {
-		s, err := em.Subscribe(AllThingsDocker)
-		if err != nil {
-			t.Fatal("subscription %d failed: %v", n, err)
+	var req http.Request
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rsc := bufio.NewScanner(strings.NewReader(response))
+		for rsc.Scan() {
+			w.Write([]byte(rsc.Text()))
+			w.(http.Flusher).Flush()
+			time.Sleep(10 * time.Millisecond)
 		}
-		subscriptions = append(subscriptions, s)
-		wg.Add(1)
-	}
+		req = *r
+	}))
+	defer server.Close()
 
-	hf := func(e Event) error {
-		wg.Done()
-		return nil
-	}
-
-	for _, s := range subscriptions {
-		s.Handle(Create, hf)
-	}
-
-	c, err := dc.CreateContainer(CreateContainerOptions{"", &Config{
-		Image: "ubuntu",
-		Cmd:   []string{"/bin/bash"},
-	}})
+	client, err := NewClient(server.URL)
 	if err != nil {
-		t.Fatalf("couldn't create test container: %v", err)
+		t.Errorf("Failed to create client: %s", err)
 	}
+	client.SkipServerVersionCheck = true
 
-	wg.Wait()
+	listener := make(chan *APIEvents, 10)
+	defer func() { time.Sleep(10 * time.Millisecond); client.RemoveEventListener(listener) }()
 
-	err = dc.RemoveContainer(RemoveContainerOptions{ID: c.ID})
+	err = client.AddEventListener(listener)
 	if err != nil {
-		t.Fatalf("unable to remove container %s: %v", c.ID, err)
+		t.Errorf("Failed to add event listener: %s", err)
 	}
 
-	em.Close()
+	timeout := time.After(1 * time.Second)
+	var count int
+
+	for {
+		select {
+		case msg := <-listener:
+			t.Logf("Recieved: %s", *msg)
+			count++
+			err = checkEvent(count, msg)
+			if err != nil {
+				t.Fatalf("Check event failed: %s", err)
+			}
+			if count == 4 {
+				return
+			}
+		case <-timeout:
+			t.Fatal("TestAddEventListener timed out waiting on events")
+		}
+	}
+}
+
+func checkEvent(index int, event *APIEvents) error {
+	if event.ID != "dfdf82bd3881" {
+		return fmt.Errorf("event ID did not match. Expected dfdf82bd3881 got %s", event.ID)
+	}
+	if event.From != "base:latest" {
+		return fmt.Errorf("event from did not match. Expected base:latest got %s", event.From)
+	}
+	var status string
+	switch index {
+	case 1:
+		status = "create"
+	case 2:
+		status = "start"
+	case 3:
+		status = "stop"
+	case 4:
+		status = "destroy"
+	}
+	if event.Status != status {
+		return fmt.Errorf("event status did not match. Expected %s got %s", status, event.Status)
+	}
+	return nil
 }

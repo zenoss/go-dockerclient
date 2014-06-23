@@ -67,13 +67,16 @@ func (c *Client) ListContainers(opts ListContainersOptions) ([]APIContainers, er
 	return containers, nil
 }
 
-// 80/tcp
+// Port represents the port number and the protocol, in the form
+// <number>/<protocol>. For example: 80/tcp.
 type Port string
 
+// Port returns the number of the port.
 func (p Port) Port() string {
 	return strings.Split(string(p), "/")[0]
 }
 
+// Proto returns the name of the protocol.
 func (p Port) Proto() string {
 	parts := strings.Split(string(p), "/")
 	if len(parts) == 1 {
@@ -82,6 +85,7 @@ func (p Port) Proto() string {
 	return parts[1]
 }
 
+// State represents the state of a container.
 type State struct {
 	sync.RWMutex
 	Running    bool
@@ -92,13 +96,13 @@ type State struct {
 	Ghost      bool
 }
 
+// String returns the string representation of a state.
 func (s *State) String() string {
 	s.RLock()
 	defer s.RUnlock()
-
 	if s.Running {
 		if s.Ghost {
-			return fmt.Sprintf("Ghost")
+			return "Ghost"
 		}
 		return fmt.Sprintf("Up %s", time.Now().UTC().Sub(s.StartedAt))
 	}
@@ -158,8 +162,8 @@ type Config struct {
 	Hostname        string
 	Domainname      string
 	User            string
-	Memory          int64
-	MemorySwap      int64
+	Memory          float64
+	MemorySwap      float64
 	CpuShares       int64
 	AttachStdin     bool
 	AttachStdout    bool
@@ -171,7 +175,7 @@ type Config struct {
 	StdinOnce       bool
 	Env             []string
 	Cmd             []string
-	Dns             []string
+	Dns             []string // For Docker API v1.9 and below only
 	Image           string
 	Volumes         map[string]struct{}
 	VolumesFrom     string
@@ -201,8 +205,9 @@ type Container struct {
 	Name           string
 	Driver         string
 
-	Volumes   map[string]string
-	VolumesRW map[string]bool
+	Volumes    map[string]string
+	VolumesRW  map[string]bool
+	HostConfig *HostConfig
 }
 
 // InspectContainer returns information about a container by its ID.
@@ -271,6 +276,9 @@ func (c *Client) CreateContainer(opts CreateContainerOptions) (*Container, error
 	if err != nil {
 		return nil, err
 	}
+
+	container.Name = opts.Name
+
 	return &container, nil
 }
 
@@ -287,6 +295,10 @@ type HostConfig struct {
 	PortBindings    map[Port][]PortBinding
 	Links           []string
 	PublishAllPorts bool
+	Dns             []string // For Docker API v1.10 and above only
+	DnsSearch       []string
+	VolumesFrom     []string
+	NetworkMode     string
 }
 
 // StartContainer starts a container, returning an errror in case of failure.
@@ -339,14 +351,25 @@ func (c *Client) RestartContainer(id string, timeout uint) error {
 	return nil
 }
 
+// KillContainerOptions represents the set of options that can be used in a
+// call to KillContainer.
+type KillContainerOptions struct {
+	// The ID of the container.
+	ID string `qs:"-"`
+
+	// The signal to send to the container. When omitted, Docker server
+	// will assume SIGKILL.
+	Signal Signal
+}
+
 // KillContainer kills a container, returning an error in case of failure.
 //
 // See http://goo.gl/DPbbBy for more details.
-func (c *Client) KillContainer(id string) error {
-	path := "/containers/" + id + "/kill"
+func (c *Client) KillContainer(opts KillContainerOptions) error {
+	path := "/containers/" + opts.ID + "/kill" + "?" + queryString(opts)
 	_, status, err := c.do("POST", path, nil)
 	if status == http.StatusNotFound {
-		return &NoSuchContainer{ID: id}
+		return &NoSuchContainer{ID: opts.ID}
 	}
 	if err != nil {
 		return err
@@ -362,6 +385,10 @@ type RemoveContainerOptions struct {
 	// A flag that indicates whether Docker should remove the volumes
 	// associated to the container.
 	RemoveVolumes bool `qs:"v"`
+
+	// A flag that indicates whether Docker should remove the container
+	// even if it is currently running.
+	Force bool
 }
 
 // RemoveContainer removes a container, returning an error in case of failure.
@@ -438,21 +465,7 @@ type CommitContainerOptions struct {
 	Tag        string
 	Message    string `qs:"m"`
 	Author     string
-	Run        *Config
-}
-
-type Image struct {
-	ID              string    `json:"id"`
-	Parent          string    `json:"parent,omitempty"`
-	Comment         string    `json:"comment,omitempty"`
-	Created         time.Time `json:"created"`
-	Container       string    `json:"container,omitempty"`
-	ContainerConfig Config    `json:"container_config,omitempty"`
-	DockerVersion   string    `json:"docker_version,omitempty"`
-	Author          string    `json:"author,omitempty"`
-	Config          *Config   `json:"config,omitempty"`
-	Architecture    string    `json:"architecture,omitempty"`
-	Size            int64
+	Run        *Config `qs:"-"`
 }
 
 // CommitContainer creates a new image from a container's changes.
@@ -460,7 +473,7 @@ type Image struct {
 // See http://goo.gl/628gxm for more details.
 func (c *Client) CommitContainer(opts CommitContainerOptions) (*Image, error) {
 	path := "/commit?" + queryString(opts)
-	body, status, err := c.do("POST", path, nil)
+	body, status, err := c.do("POST", path, opts.Run)
 	if status == http.StatusNotFound {
 		return nil, &NoSuchContainer{ID: opts.Container}
 	}
@@ -484,7 +497,6 @@ type AttachToContainerOptions struct {
 	InputStream  io.Reader `qs:"-"`
 	OutputStream io.Writer `qs:"-"`
 	ErrorStream  io.Writer `qs:"-"`
-	RawTerminal  bool      `qs:"-"`
 
 	// Get container logs, sending it to OutputStream.
 	Logs bool
@@ -492,7 +504,7 @@ type AttachToContainerOptions struct {
 	// Stream the response?
 	Stream bool
 
-	// Attach to stdin, and use InputFile.
+	// Attach to stdin, and use InputStream.
 	Stdin bool
 
 	// Attach to stdout, and use OutputStream.
@@ -500,6 +512,16 @@ type AttachToContainerOptions struct {
 
 	// Attach to stderr, and use ErrorStream.
 	Stderr bool
+
+	// If set, after a successful connect, a sentinel will be sent and then the
+	// client will block on receive before continuing.
+	//
+	// It must be an unbuffered channel. Using a buffered channel can lead
+	// to unexpected behavior.
+	Success chan struct{}
+
+	// Use raw terminal? Usually true when the container contains a TTY.
+	RawTerminal bool `qs:"-"`
 }
 
 // AttachToContainer attaches to a container, using the given options.
@@ -510,7 +532,31 @@ func (c *Client) AttachToContainer(opts AttachToContainerOptions) error {
 		return &NoSuchContainer{ID: opts.Container}
 	}
 	path := "/containers/" + opts.Container + "/attach?" + queryString(opts)
-	return c.hijack("POST", path, opts.RawTerminal, opts.InputStream, opts.ErrorStream, opts.OutputStream)
+	return c.hijack("POST", path, opts.Success, opts.RawTerminal, opts.InputStream, opts.ErrorStream, opts.OutputStream)
+}
+
+// LogsOptions represents the set of options used when getting logs from a
+// container.
+//
+// See http://goo.gl/rLhKSU for more details.
+type LogsOptions struct {
+	Container    string    `qs:"-"`
+	OutputStream io.Writer `qs:"-"`
+	Follow       bool
+	Stdout       bool
+	Stderr       bool
+	Timestamps   bool
+}
+
+// Logs gets stdout and stderr logs from the specified container.
+//
+// See http://goo.gl/rLhKSU for more details.
+func (c *Client) Logs(opts LogsOptions) error {
+	if opts.Container == "" {
+		return &NoSuchContainer{ID: opts.Container}
+	}
+	path := "/containers/" + opts.Container + "/logs?" + queryString(opts)
+	return c.stream("GET", path, nil, nil, opts.OutputStream)
 }
 
 // ResizeContainerTTY resizes the terminal to the given height and width.
