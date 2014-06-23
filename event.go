@@ -209,9 +209,11 @@ func (em *clientEventMonitor) dispatch(e string) error {
 	}
 
 	// send the event to subscribers interested in the particular ID
-	if subs, ok := em.subscriptions[evt["id"].(string)]; ok {
-		for _, sub := range subs {
-			sub.eventChannel <- evt
+	if evt["id"] != nil {
+		if subs, ok := em.subscriptions[evt["id"].(string)]; ok {
+			for _, sub := range subs {
+				sub.eventChannel <- evt
+			}
 		}
 	}
 
