@@ -11,7 +11,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/fsouza/go-dockerclient/engine"
+	"github.com/zenoss/go-dockerclient/engine"
 )
 
 type DockerVersion struct {

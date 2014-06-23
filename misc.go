@@ -8,7 +8,7 @@ import (
 	"bytes"
 	"io"
 
-	"github.com/fsouza/go-dockerclient/engine"
+	"github.com/zenoss/go-dockerclient/engine"
 )
 
 // Version returns version information about the docker server.
