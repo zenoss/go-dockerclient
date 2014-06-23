@@ -7,10 +7,11 @@ package docker_test
 import (
 	"archive/tar"
 	"bytes"
-	"github.com/zenoss/go-dockerclient"
 	"io"
 	"log"
 	"time"
+
+	"github.com/zenoss/go-dockerclient"
 )
 
 func ExampleClient_AttachToContainer() {
@@ -18,6 +19,7 @@ func ExampleClient_AttachToContainer() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	client.SkipServerVersionCheck = true
 	// Reading logs from container a84849 and sending them to buf.
 	var buf bytes.Buffer
 	err = client.AttachToContainer(docker.AttachToContainerOptions{
@@ -80,6 +82,7 @@ func ExampleClient_BuildImage() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	t := time.Now()
 	inputbuf, outputbuf := bytes.NewBuffer(nil), bytes.NewBuffer(nil)
 	tr := tar.NewWriter(inputbuf)
@@ -94,4 +97,38 @@ func ExampleClient_BuildImage() {
 	if err := client.BuildImage(opts); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func ExampleClient_ListenEvents() {
+	client, err := docker.NewClient("http://localhost:4243")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	listener := make(chan *docker.APIEvents)
+	err = client.AddEventListener(listener)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer func() {
+
+		err = client.RemoveEventListener(listener)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+	}()
+
+	timeout := time.After(1 * time.Second)
+
+	for {
+		select {
+		case msg := <-listener:
+			log.Println(msg)
+		case <-timeout:
+			break
+		}
+	}
+
 }

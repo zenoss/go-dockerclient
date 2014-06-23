@@ -7,6 +7,7 @@ package docker
 import (
 	"bytes"
 	"encoding/json"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -131,8 +132,8 @@ func TestInspectContainer(t *testing.T) {
              "Config": {
                      "Hostname": "4fa6e0f0c678",
                      "User": "",
-                     "Memory": 0,
-                     "MemorySwap": 0,
+                     "Memory": 2.68435456e+08,
+                     "MemorySwap": 2.68435456e+08,
                      "AttachStdin": false,
                      "AttachStdout": true,
                      "AttachStderr": true,
@@ -144,7 +145,6 @@ func TestInspectContainer(t *testing.T) {
                      "Cmd": [
                              "date"
                      ],
-                     "Dns": null,
                      "Image": "base",
                      "Volumes": {},
                      "VolumesFrom": ""
@@ -166,7 +166,23 @@ func TestInspectContainer(t *testing.T) {
              },
              "SysInitPath": "/home/kitty/go/src/github.com/dotcloud/docker/bin/docker",
              "ResolvConfPath": "/etc/resolv.conf",
-             "Volumes": {}
+             "Volumes": {},
+             "HostConfig": {
+               "Binds": null,
+               "ContainerIDFile": "",
+               "LxcConf": [],
+               "Privileged": false,
+               "PortBindings": {
+                 "80/tcp": [
+                   {
+                     "HostIp": "0.0.0.0",
+                     "HostPort": "49153"
+                   }
+                 ]
+               },
+               "Links": null,
+               "PublishAllPorts": false
+             }
 }`
 	var expected Container
 	err := json.Unmarshal([]byte(jsonContainer), &expected)
@@ -433,7 +449,7 @@ func TestKillContainer(t *testing.T) {
 	fakeRT := &FakeRoundTripper{message: "", status: http.StatusNoContent}
 	client := newTestClient(fakeRT)
 	id := "4fa6e0f0c6786287e131c3852c58a2e01cc697a68231826813597e4994f1d6e2"
-	err := client.KillContainer(id)
+	err := client.KillContainer(KillContainerOptions{ID: id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,9 +463,26 @@ func TestKillContainer(t *testing.T) {
 	}
 }
 
+func TestKillContainerSignal(t *testing.T) {
+	fakeRT := &FakeRoundTripper{message: "", status: http.StatusNoContent}
+	client := newTestClient(fakeRT)
+	id := "4fa6e0f0c6786287e131c3852c58a2e01cc697a68231826813597e4994f1d6e2"
+	err := client.KillContainer(KillContainerOptions{ID: id, Signal: SIGTERM})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := fakeRT.requests[0]
+	if req.Method != "POST" {
+		t.Errorf("KillContainer(%q): wrong HTTP method. Want %q. Got %q.", id, "POST", req.Method)
+	}
+	if signal := req.URL.Query().Get("signal"); signal != "15" {
+		t.Errorf("KillContainer(%q): Wrong query string in request. Want %q. Got %q.", id, "15", signal)
+	}
+}
+
 func TestKillContainerNotFound(t *testing.T) {
 	client := newTestClient(&FakeRoundTripper{message: "no such container", status: http.StatusNotFound})
-	err := client.KillContainer("a2334")
+	err := client.KillContainer(KillContainerOptions{ID: "a2334"})
 	expected := &NoSuchContainer{ID: "a2334"}
 	if !reflect.DeepEqual(err, expected) {
 		t.Errorf("KillContainer: Wrong error returned. Want %#v. Got %#v.", expected, err)
@@ -572,20 +605,23 @@ func TestCommitContainer(t *testing.T) {
 
 func TestCommitContainerParams(t *testing.T) {
 	cfg := Config{Memory: 67108864}
-	b, _ := json.Marshal(&cfg)
+	json, _ := json.Marshal(&cfg)
 	var tests = []struct {
 		input  CommitContainerOptions
 		params map[string][]string
+		body   []byte
 	}{
-		{CommitContainerOptions{}, map[string][]string{}},
-		{CommitContainerOptions{Container: "44c004db4b17"}, map[string][]string{"container": {"44c004db4b17"}}},
+		{CommitContainerOptions{}, map[string][]string{}, nil},
+		{CommitContainerOptions{Container: "44c004db4b17"}, map[string][]string{"container": {"44c004db4b17"}}, nil},
 		{
 			CommitContainerOptions{Container: "44c004db4b17", Repository: "tsuru/python", Message: "something"},
 			map[string][]string{"container": {"44c004db4b17"}, "repo": {"tsuru/python"}, "m": {"something"}},
+			nil,
 		},
 		{
 			CommitContainerOptions{Container: "44c004db4b17", Run: &cfg},
-			map[string][]string{"container": {"44c004db4b17"}, "run": {string(b)}},
+			map[string][]string{"container": {"44c004db4b17"}},
+			json,
 		},
 	}
 	fakeRT := &FakeRoundTripper{message: "[]", status: http.StatusOK}
@@ -602,6 +638,15 @@ func TestCommitContainerParams(t *testing.T) {
 		}
 		if meth := fakeRT.requests[0].Method; meth != "POST" {
 			t.Errorf("Wrong HTTP method. Want POST. Got %s.", meth)
+		}
+		if tt.body != nil {
+			if requestBody, err := ioutil.ReadAll(fakeRT.requests[0].Body); err == nil {
+				if bytes.Compare(requestBody, tt.body) != 0 {
+					t.Errorf("Expected body %#v, got %#v", tt.body, requestBody)
+				}
+			} else {
+				t.Errorf("Error reading request body: %#v", err)
+			}
 		}
 		fakeRT.Reset()
 	}
@@ -627,11 +672,13 @@ func TestCommitContainerNotFound(t *testing.T) {
 func TestAttachToContainerLogs(t *testing.T) {
 	var req http.Request
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("something happened"))
+		w.Write([]byte{1, 0, 0, 0, 0, 0, 0, 19})
+		w.Write([]byte("something happened!"))
 		req = *r
 	}))
 	defer server.Close()
 	client, _ := NewClient(server.URL)
+	client.SkipServerVersionCheck = true
 	var buf bytes.Buffer
 	opts := AttachToContainerOptions{
 		Container:    "a123456",
@@ -639,13 +686,12 @@ func TestAttachToContainerLogs(t *testing.T) {
 		Stdout:       true,
 		Stderr:       true,
 		Logs:         true,
-		RawTerminal:  true,
 	}
 	err := client.AttachToContainer(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := "something happened"
+	expected := "something happened!"
 	if buf.String() != expected {
 		t.Errorf("AttachToContainer for logs: wrong output. Want %q. Got %q.", expected, buf.String())
 	}
@@ -668,57 +714,16 @@ func TestAttachToContainerLogs(t *testing.T) {
 }
 
 func TestAttachToContainer(t *testing.T) {
-	file, err := os.OpenFile(os.TempDir()+"/docker-temp-file.txt", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	file.Write([]byte("send value"))
-	file.Seek(0, 0)
-	var req http.Request
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("something happened!"))
-		req = *r
-	}))
-	defer server.Close()
-	client, _ := NewClient(server.URL)
-	var stdout, stderr bytes.Buffer
-	opts := AttachToContainerOptions{
-		Container:    "a123456",
-		OutputStream: &stdout,
-		ErrorStream:  &stderr,
-		InputStream:  file,
-		Stdin:        true,
-		Stdout:       true,
-		Stderr:       true,
-		Stream:       true,
-		RawTerminal:  true,
-	}
-	err = client.AttachToContainer(opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	expected := map[string][]string{
-		"stdin":  {"1"},
-		"stdout": {"1"},
-		"stderr": {"1"},
-		"stream": {"1"},
-	}
-	got := map[string][]string(req.URL.Query())
-	if !reflect.DeepEqual(got, expected) {
-		t.Errorf("AttachToContainer: wrong query string. Want %#v. Got %#v.", expected, got)
-	}
-}
-
-func TestAttachToContainerInputStreamReader(t *testing.T) {
 	var reader = strings.NewReader("send value")
 	var req http.Request
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("something happened!"))
+		w.Write([]byte{1, 0, 0, 0, 0, 0, 0, 5})
+		w.Write([]byte("hello"))
 		req = *r
 	}))
 	defer server.Close()
 	client, _ := NewClient(server.URL)
+	client.SkipServerVersionCheck = true
 	var stdout, stderr bytes.Buffer
 	opts := AttachToContainerOptions{
 		Container:    "a123456",
@@ -747,36 +752,60 @@ func TestAttachToContainerInputStreamReader(t *testing.T) {
 	}
 }
 
-func TestAttachToContainerRawTerminalFalse(t *testing.T) {
-	file, err := os.OpenFile(os.TempDir()+"/docker-temp-file.txt", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	file.Write([]byte("send value"))
-	file.Seek(0, 0)
+func TestAttachToContainerSentinel(t *testing.T) {
+	var reader = strings.NewReader("send value")
 	var req http.Request
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		prefix := []byte{1, 0, 0, 0, 5, 0, 0, 0}
+		w.Write([]byte{1, 0, 0, 0, 0, 0, 0, 5})
+		w.Write([]byte("hello"))
+		req = *r
+	}))
+	defer server.Close()
+	client, _ := NewClient(server.URL)
+	client.SkipServerVersionCheck = true
+	var stdout, stderr bytes.Buffer
+	success := make(chan struct{})
+	opts := AttachToContainerOptions{
+		Container:    "a123456",
+		OutputStream: &stdout,
+		ErrorStream:  &stderr,
+		InputStream:  reader,
+		Stdin:        true,
+		Stdout:       true,
+		Stderr:       true,
+		Stream:       true,
+		RawTerminal:  true,
+		Success:      success,
+	}
+	go client.AttachToContainer(opts)
+	success <- <-success
+}
+
+func TestAttachToContainerRawTerminalFalse(t *testing.T) {
+	input := strings.NewReader("send value")
+	var req http.Request
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prefix := []byte{1, 0, 0, 0, 0, 0, 0, 5}
 		w.Write(prefix)
 		w.Write([]byte("hello"))
 		req = *r
 	}))
 	defer server.Close()
 	client, _ := NewClient(server.URL)
+	client.SkipServerVersionCheck = true
 	var stdout, stderr bytes.Buffer
 	opts := AttachToContainerOptions{
 		Container:    "a123456",
 		OutputStream: &stdout,
 		ErrorStream:  &stderr,
-		InputStream:  file,
+		InputStream:  input,
 		Stdin:        true,
 		Stdout:       true,
 		Stderr:       true,
 		Stream:       true,
 		RawTerminal:  false,
 	}
-	err = client.AttachToContainer(opts)
+	err := client.AttachToContainer(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -790,11 +819,70 @@ func TestAttachToContainerRawTerminalFalse(t *testing.T) {
 	if !reflect.DeepEqual(got, expected) {
 		t.Errorf("AttachToContainer: wrong query string. Want %#v. Got %#v.", expected, got)
 	}
+	t.Log(stderr.String())
+	t.Log(stdout.String())
+	if stdout.String() != "hello" {
+		t.Errorf("AttachToContainer: wrong content written to stdout. Want %q. Got %q.", "hello", stderr.String())
+	}
 }
 
 func TestAttachToContainerWithoutContainer(t *testing.T) {
 	var client Client
 	err := client.AttachToContainer(AttachToContainerOptions{})
+	expected := &NoSuchContainer{ID: ""}
+	if !reflect.DeepEqual(err, expected) {
+		t.Errorf("AttachToContainer: wrong error. Want %#v. Got %#v.", expected, err)
+	}
+}
+
+func TestLogs(t *testing.T) {
+	var req http.Request
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("something happened!"))
+		req = *r
+	}))
+	defer server.Close()
+	client, _ := NewClient(server.URL)
+	client.SkipServerVersionCheck = true
+	var buf bytes.Buffer
+	opts := LogsOptions{
+		Container:    "a123456",
+		OutputStream: &buf,
+		Follow:       true,
+		Stdout:       true,
+		Stderr:       true,
+		Timestamps:   true,
+	}
+	err := client.Logs(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := "something happened!"
+	if buf.String() != expected {
+		t.Errorf("Logs: wrong output. Want %q. Got %q.", expected, buf.String())
+	}
+	if req.Method != "GET" {
+		t.Errorf("Logs: wrong HTTP method. Want GET. Got %s.", req.Method)
+	}
+	u, _ := url.Parse(client.getURL("/containers/a123456/logs"))
+	if req.URL.Path != u.Path {
+		t.Errorf("AttachToContainer for logs: wrong HTTP path. Want %q. Got %q.", u.Path, req.URL.Path)
+	}
+	expectedQs := map[string][]string{
+		"follow":     {"1"},
+		"stdout":     {"1"},
+		"stderr":     {"1"},
+		"timestamps": {"1"},
+	}
+	got := map[string][]string(req.URL.Query())
+	if !reflect.DeepEqual(got, expectedQs) {
+		t.Errorf("Logs: wrong query string. Want %#v. Got %#v.", expectedQs, got)
+	}
+}
+
+func TestLogsNoContainer(t *testing.T) {
+	var client Client
+	err := client.Logs(LogsOptions{})
 	expected := &NoSuchContainer{ID: ""}
 	if !reflect.DeepEqual(err, expected) {
 		t.Errorf("AttachToContainer: wrong error. Want %#v. Got %#v.", expected, err)
@@ -835,9 +923,10 @@ func TestExportContainerViaUnixSocket(t *testing.T) {
 	endpoint := "unix://" + tempSocket
 	u, _ := parseEndpoint(endpoint)
 	client := Client{
-		endpoint:    endpoint,
-		endpointURL: u,
-		client:      http.DefaultClient,
+		endpoint:               endpoint,
+		endpointURL:            u,
+		client:                 http.DefaultClient,
+		SkipServerVersionCheck: true,
 	}
 	listening := make(chan string)
 	done := make(chan int)
@@ -909,5 +998,23 @@ func TestCopyFromContainerEmptyContainer(t *testing.T) {
 	_, ok := err.(*NoSuchContainer)
 	if !ok {
 		t.Errorf("CopyFromContainer: invalid error returned. Want NoSuchContainer, got %#v.", err)
+	}
+}
+
+func TestPassingNameOptToCreateContainerReturnsItInContainer(t *testing.T) {
+	jsonContainer := `{
+             "Id": "4fa6e0f0c6786287e131c3852c58a2e01cc697a68231826813597e4994f1d6e2",
+	     "Warnings": []
+}`
+	fakeRT := &FakeRoundTripper{message: jsonContainer, status: http.StatusOK}
+	client := newTestClient(fakeRT)
+	config := Config{AttachStdout: true, AttachStdin: true}
+	opts := CreateContainerOptions{Name: "TestCreateContainer", Config: &config}
+	container, err := client.CreateContainer(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if container.Name != "TestCreateContainer" {
+		t.Errorf("Container name expected to be TestCreateContainer, was %s", container.Name)
 	}
 }
