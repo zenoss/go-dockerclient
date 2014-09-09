@@ -15,9 +15,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"time"
 )
 
-// This work with api verion < v1.7 and > v1.9
+// APIImages represent an image returned in the ListImages call.
 type APIImages struct {
 	ID          string   `json:"Id"`
 	RepoTags    []string `json:",omitempty"`
@@ -29,11 +30,45 @@ type APIImages struct {
 	Tag         string `json:",omitempty"`
 }
 
-// Error returned when the image does not exist.
+type Image struct {
+	ID              string    `json:"id"`
+	Parent          string    `json:"parent,omitempty"`
+	Comment         string    `json:"comment,omitempty"`
+	Created         time.Time `json:"created"`
+	Container       string    `json:"container,omitempty"`
+	ContainerConfig Config    `json:"containerconfig,omitempty"`
+	DockerVersion   string    `json:"dockerversion,omitempty"`
+	Author          string    `json:"author,omitempty"`
+	Config          *Config   `json:"config,omitempty"`
+	Architecture    string    `json:"architecture,omitempty"`
+	Size            int64
+}
+
+type ImagePre012 struct {
+	ID              string    `json:"id"`
+	Parent          string    `json:"parent,omitempty"`
+	Comment         string    `json:"comment,omitempty"`
+	Created         time.Time `json:"created"`
+	Container       string    `json:"container,omitempty"`
+	ContainerConfig Config    `json:"container_config,omitempty"`
+	DockerVersion   string    `json:"docker_version,omitempty"`
+	Author          string    `json:"author,omitempty"`
+	Config          *Config   `json:"config,omitempty"`
+	Architecture    string    `json:"architecture,omitempty"`
+	Size            int64
+}
+
 var (
-	ErrNoSuchImage         = errors.New("No such image")
-	ErrMissingRepo         = errors.New("Missing remote repository e.g. 'github.com/user/repo'")
-	ErrMissingOutputStream = errors.New("Missing output stream")
+	// ErrNoSuchImage is the error returned when the image does not exist.
+	ErrNoSuchImage = errors.New("no such image")
+
+	// ErrMissingRepo is the error returned when the remote repository is
+	// missing.
+	ErrMissingRepo = errors.New("missing remote repository e.g. 'github.com/user/repo'")
+
+	// ErrMissingOutputStream is the error returned when no output stream
+	// is provided to some calls, like BuildImage.
+	ErrMissingOutputStream = errors.New("missing output stream")
 )
 
 // ListImages returns the list of available images in the server.
@@ -80,11 +115,35 @@ func (c *Client) InspectImage(name string) (*Image, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	var image Image
-	err = json.Unmarshal(body, &image)
-	if err != nil {
-		return nil, err
+
+	// if the caller elected to skip checking the server's version, assume it's the latest
+	if c.SkipServerVersionCheck || c.expectedApiVersion.GreaterThanOrEqualTo(apiVersion_1_12) {
+		err = json.Unmarshal(body, &image)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		var imagePre012 ImagePre012
+		err = json.Unmarshal(body, &imagePre012)
+		if err != nil {
+			return nil, err
+		}
+
+		image.ID = imagePre012.ID
+		image.Parent = imagePre012.Parent
+		image.Comment = imagePre012.Comment
+		image.Created = imagePre012.Created
+		image.Container = imagePre012.Container
+		image.ContainerConfig = imagePre012.ContainerConfig
+		image.DockerVersion = imagePre012.DockerVersion
+		image.Author = imagePre012.Author
+		image.Config = imagePre012.Config
+		image.Architecture = imagePre012.Architecture
+		image.Size = imagePre012.Size
 	}
+
 	return &image, nil
 }
 
@@ -140,8 +199,8 @@ func (c *Client) PushImage(opts PushImageOptions, auth AuthConfiguration) error 
 type PullImageOptions struct {
 	Repository   string `qs:"fromImage"`
 	Registry     string
-	OutputStream io.Writer `qs:"-"`
 	Tag          string    `qs:"tag"`
+	OutputStream io.Writer `qs:"-"`
 }
 
 // PullImage pulls an image from a remote registry, logging progress to w.
@@ -188,7 +247,7 @@ func (c *Client) ImportImage(opts ImportImageOptions) error {
 	if opts.Source != "-" {
 		opts.InputStream = nil
 	}
-	if opts.Source != "-" && !isUrl(opts.Source) {
+	if opts.Source != "-" && !isURL(opts.Source) {
 		f, err := os.Open(opts.Source)
 		if err != nil {
 			return err
@@ -232,13 +291,18 @@ func (c *Client) BuildImage(opts BuildImageOptions) error {
 		queryString(&opts)), headers, opts.InputStream, opts.OutputStream)
 }
 
+// TagImageOptions present the set of options to tag an image
 type TagImageOptions struct {
 	Repo  string `qs:"repo"`
 	Force bool   `qs:"force,omitempty"`
 	Tag   string `qs:"tag"`
 }
 
+// TagImage adds a tag to the image 'name'
 func (c *Client) TagImage(name string, opts TagImageOptions) error {
+	if name == "" {
+		return ErrNoSuchImage
+	}
 	_, status, err := c.do("POST", fmt.Sprintf("/images/"+name+"/tag?%s",
 		queryString(&opts)), nil)
 	if status == http.StatusNotFound {
@@ -248,7 +312,7 @@ func (c *Client) TagImage(name string, opts TagImageOptions) error {
 	return err
 }
 
-func isUrl(u string) bool {
+func isURL(u string) bool {
 	p, err := url.Parse(u)
 	if err != nil {
 		return false

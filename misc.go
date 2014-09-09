@@ -6,8 +6,9 @@ package docker
 
 import (
 	"bytes"
-	"github.com/zenoss/go-dockerclient/engine"
 	"io"
+
+	"github.com/zenoss/go-dockerclient/engine"
 )
 
 // Version returns version information about the docker server.

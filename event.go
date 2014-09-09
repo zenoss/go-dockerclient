@@ -1,318 +1,278 @@
+// Copyright 2014 go-dockerclient authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package docker
 
 import (
-	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
+	"net"
+	"net/http"
+	"net/http/httputil"
 	"sync"
-
-	"github.com/zenoss/go-dockerclient/utils"
+	"sync/atomic"
+	"time"
 )
 
-// AllThingsDocker is a wildcard used to express interest in the Docker
-// lifecycle event streams of all containers and images.
-const AllThingsDocker = "*"
+// APIEvents represents an event returned by the API.
+type APIEvents struct {
+	Status string
+	ID     string
+	From   string
+	Time   int64
+}
 
-// Selectors for the various Docker lifecycle events.
+type eventMonitoringState struct {
+	sync.RWMutex
+	sync.WaitGroup
+	enabled   bool
+	lastSeen  *int64
+	C         chan *APIEvents
+	errC      chan error
+	listeners []chan<- *APIEvents
+}
+
 const (
-	Create  = "create"
-	Delete  = "delete"
-	Destroy = "destroy"
-	Die     = "die"
-	Export  = "export"
-	Kill    = "kill"
-	Restart = "restart"
-	Start   = "start"
-	Stop    = "stop"
-	Untag   = "untag"
+	maxMonitorConnRetries = 5
+	retryInitialWaitTime  = 10.
 )
 
-// EventMonitor implementations may be used to subscribe to Docker
-// lifecycle events. This package provides such an implementation.
-// Instances of it may be retreived via the client.EventMonitor() method.
-type EventMonitor interface {
-	// IsActive reports whether or not an EventMonitor is active, i.e., listening for Docker events.
-	IsActive() bool
+var (
+	// ErrNoListeners is the error returned when no listeners are available
+	// to receive an event.
+	ErrNoListeners = errors.New("no listeners present to receive event")
 
-	// Subscribe returns a subscription to which handlers for the various Docker lifecycle events
-	// for the container or image specified by ID (or all containers and images if AllThingsDocker
-	// is passed) may be added.
-	Subscribe(ID string) (*Subscription, error)
+	// ErrListenerAlreadyExists is the error returned when the listerner already
+	// exists.
+	ErrListenerAlreadyExists = errors.New("listener already exists for docker events")
+)
 
-	// Close causes the EventMonitor to stop listening for Docker lifecycle events.
-	Close() error
-}
-
-// Event represents a Docker lifecycle event.
-type Event map[string]interface{}
-
-// A HandlerFunc is used to receive Docker lifecycle events.
-type HandlerFunc func(e Event) error
-
-type clientEventMonitor struct {
-	sync.Mutex
-	active        bool
-	closeChannel  chan chan struct{}
-	done          chan struct{}
-	subscriptions map[string][]*Subscription
-}
-
-// Subscription represents a subscription to a particular container or image's Docker lifecycle
-// event stream. The AllThingsDocker ID can be used to subscribe to all container and image
-// event streams.
-type Subscription struct {
-	ID            string
-	active        bool
-	cancelChannel chan chan struct{}
-	eventChannel  chan Event
-	monitorDone   chan struct{}
-	handlers      map[string]HandlerFunc
-	monitor       *clientEventMonitor
-}
-
-// eventMonitor is used by the client to monitor Docker lifecycle events
-var eventMonitor = &clientEventMonitor{
-	active:        false,
-	closeChannel:  make(chan chan struct{}),
-	done:          make(chan struct{}),
-	subscriptions: make(map[string][]*Subscription),
-}
-
-// validEvents is a map used to check event strings for validity
-var validEvents = map[string]struct{}{
-	Create:  struct{}{},
-	Delete:  struct{}{},
-	Destroy: struct{}{},
-	Die:     struct{}{},
-	Export:  struct{}{},
-	Kill:    struct{}{},
-	Restart: struct{}{},
-	Start:   struct{}{},
-	Stop:    struct{}{},
-	Untag:   struct{}{},
-}
-
-// MonitorEvents returns an EventMonitor that can be used to listen for and respond to
-// the various events in the Docker container and image lifecycles.
-func (c *Client) MonitorEvents() (EventMonitor, error) {
-	if err := eventMonitor.run(c); err != nil {
-		return nil, err
-	}
-
-	return eventMonitor, nil
-}
-
-// IsActive reports whether or not an EventMonitor is active, i.e., listening for Docker events.
-func (em *clientEventMonitor) IsActive() bool {
-	em.Lock()
-	defer em.Unlock()
-
-	return em.active
-}
-
-// Close causes the EventMonitor to stop listening for Docker events.
-func (em *clientEventMonitor) Close() error {
-	em.Lock()
-	defer em.Unlock()
-
-	if !em.active {
-		return nil
-	}
-
-	crc := make(chan struct{})
-	em.closeChannel <- crc
-
-	select {
-	case <-crc:
-		em.active = false
-		em.subscriptions = make(map[string][]*Subscription)
-		em.done = make(chan struct{})
-		return nil
-	}
-
-	return fmt.Errorf("unable to close %v", em)
-}
-
-// Subscribe returns a subscription to which handlers for the various Docker lifecycle events
-// for the container or image specified by ID (or all containers and images if AllThingsDocker
-// is passed) may be added.
-func (em *clientEventMonitor) Subscribe(ID string) (*Subscription, error) {
-	em.Lock()
-	defer em.Unlock()
-
-	s := &Subscription{
-		ID:            ID,
-		cancelChannel: make(chan chan struct{}),
-		eventChannel:  make(chan Event),
-		monitorDone:   em.done,
-		handlers:      make(map[string]HandlerFunc),
-		monitor:       em,
-	}
-
-	em.subscriptions[ID] = append(em.subscriptions[ID], s)
-	s.run()
-
-	return s, nil
-}
-
-// run causes the clientEventMonitor to start listening for Docker container
-// and image lifecycle events
-func (em *clientEventMonitor) run(c *Client) error {
-	em.Lock()
-	defer em.Unlock()
-
-	if em.active {
-		return nil
-	}
-
-	go func() {
-		r, w := io.Pipe()
-
-		go listenAndDispatch(c, em, r, w)
-
-		select {
-		case crc := <-em.closeChannel:
-			w.Close()
-			r.Close()
-			close(em.done)
-			crc <- struct{}{}
-			return
+// AddEventListener adds a new listener to container events in the Docker API.
+//
+// The parameter is a channel through which events will be sent.
+func (c *Client) AddEventListener(listener chan<- *APIEvents) error {
+	var err error
+	if !c.eventMonitor.isEnabled() {
+		err = c.eventMonitor.enableEventMonitoring(c)
+		if err != nil {
+			return err
 		}
-	}()
-
-	em.active = true
-	return nil
-}
-
-// dispatch sends the incoming event to the event channel of all interested subscribers.
-func (em *clientEventMonitor) dispatch(e string) error {
-	em.Lock()
-	defer em.Unlock()
-
-	if !em.active {
-		return nil
 	}
-
-	var evt Event
-
-	err := json.Unmarshal([]byte(e), &evt)
+	err = c.eventMonitor.addListener(listener)
 	if err != nil {
 		return err
 	}
+	return nil
+}
 
-	// send the event to subscribers interested in everything
-	if subs, ok := em.subscriptions[AllThingsDocker]; ok {
-		for _, sub := range subs {
-			sub.eventChannel <- evt
+// RemoveEventListener removes a listener from the monitor.
+func (c *Client) RemoveEventListener(listener chan *APIEvents) error {
+	err := c.eventMonitor.removeListener(listener)
+	if err != nil {
+		return err
+	}
+	if len(c.eventMonitor.listeners) == 0 {
+		err = c.eventMonitor.disableEventMonitoring()
+		if err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
-	// send the event to subscribers interested in the particular ID
-	if evt["id"] != nil {
-		if subs, ok := em.subscriptions[evt["id"].(string)]; ok {
-			for _, sub := range subs {
-				sub.eventChannel <- evt
+func (eventState *eventMonitoringState) addListener(listener chan<- *APIEvents) error {
+	eventState.Lock()
+	defer eventState.Unlock()
+	if listenerExists(listener, &eventState.listeners) {
+		return ErrListenerAlreadyExists
+	}
+	eventState.Add(1)
+	eventState.listeners = append(eventState.listeners, listener)
+	return nil
+}
+
+func (eventState *eventMonitoringState) removeListener(listener chan<- *APIEvents) error {
+	eventState.Lock()
+	defer eventState.Unlock()
+	if listenerExists(listener, &eventState.listeners) {
+		var newListeners []chan<- *APIEvents
+		for _, l := range eventState.listeners {
+			if l != listener {
+				newListeners = append(newListeners, l)
 			}
 		}
+		eventState.listeners = newListeners
+		eventState.Add(-1)
 	}
-
 	return nil
 }
 
-// unsubscribe removes the given Subscription from the event monitor's list of subscribers
-func (em *clientEventMonitor) unsubscribe(s *Subscription) error {
-	em.Lock()
-	defer em.Unlock()
-
-	ns := []*Subscription{}
-	for _, sub := range em.subscriptions[s.ID] {
-		if sub != s {
-			ns = append(ns, sub)
+func listenerExists(a chan<- *APIEvents, list *[]chan<- *APIEvents) bool {
+	for _, b := range *list {
+		if b == a {
+			return true
 		}
 	}
+	return false
+}
 
-	em.subscriptions[s.ID] = ns
-
+func (eventState *eventMonitoringState) enableEventMonitoring(c *Client) error {
+	eventState.Lock()
+	defer eventState.Unlock()
+	if !eventState.enabled {
+		eventState.enabled = true
+		var lastSeenDefault = int64(0)
+		eventState.lastSeen = &lastSeenDefault
+		eventState.C = make(chan *APIEvents, 100)
+		eventState.errC = make(chan error, 1)
+		go eventState.monitorEvents(c)
+	}
 	return nil
 }
 
-// listenAndDispatch reads the Docker event stream and dispatches the events
-// it receives.
-func listenAndDispatch(c *Client, em *clientEventMonitor, r *io.PipeReader, w *io.PipeWriter) {
-	// TODO: figure out how to cleanly shutdown the hijacked connection
-	go c.hijack("GET", "/events", true, nil, nil, w)
+func (eventState *eventMonitoringState) disableEventMonitoring() error {
+	eventState.Wait()
+	eventState.Lock()
+	defer eventState.Unlock()
+	if eventState.enabled {
+		eventState.enabled = false
+		close(eventState.C)
+		close(eventState.errC)
+	}
+	return nil
+}
 
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		et := scanner.Text()
-		if et != "" && et[0] == '{' {
-			if err := em.dispatch(et); err != nil {
-				utils.Debugf("unable to dispatch: %s (%v)", et, err)
+func (eventState *eventMonitoringState) monitorEvents(c *Client) {
+	var err error
+	for eventState.noListeners() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err = eventState.connectWithRetry(c); err != nil {
+		eventState.terminate(err)
+	}
+	for eventState.isEnabled() {
+		timeout := time.After(100 * time.Millisecond)
+		select {
+		case ev, ok := <-eventState.C:
+			if !ok {
+				return
 			}
+			go eventState.sendEvent(ev)
+			go eventState.updateLastSeen(ev)
+		case err = <-eventState.errC:
+			if err == ErrNoListeners {
+				eventState.terminate(nil)
+				return
+			} else if err != nil {
+				defer func() { go eventState.monitorEvents(c) }()
+				return
+			}
+		case <-timeout:
+			continue
 		}
 	}
 }
 
-// Handle associates a HandlerFunc h with a the Docker container or image lifecycle
-// event specified by es. Any HandlerFunc previously associated with es is replaced.
-func (s *Subscription) Handle(es string, h HandlerFunc) error {
-	if _, ok := validEvents[es]; !ok {
-		return fmt.Errorf("unknown event: %s", es)
+func (eventState *eventMonitoringState) connectWithRetry(c *Client) error {
+	var retries int
+	var err error
+	for err = c.eventHijack(atomic.LoadInt64(eventState.lastSeen), eventState.C, eventState.errC); err != nil && retries < maxMonitorConnRetries; retries++ {
+		waitTime := int64(retryInitialWaitTime * math.Pow(2, float64(retries)))
+		time.Sleep(time.Duration(waitTime) * time.Millisecond)
+		err = c.eventHijack(atomic.LoadInt64(eventState.lastSeen), eventState.C, eventState.errC)
 	}
-
-	s.handlers[es] = h
-	return nil
+	return err
 }
 
-// Cancel causes the Subscription to stop receiving and dispatching Docker container and
-// image lifecycle events.
-func (s *Subscription) Cancel() error {
-	if !s.active {
-		return nil
-	}
+func (eventState *eventMonitoringState) noListeners() bool {
+	eventState.RLock()
+	defer eventState.RUnlock()
+	return len(eventState.listeners) == 0
+}
 
-	crc := make(chan struct{})
-	s.cancelChannel <- crc
+func (eventState *eventMonitoringState) isEnabled() bool {
+	eventState.RLock()
+	defer eventState.RUnlock()
+	return eventState.enabled
+}
 
-	select {
-	case <-crc:
-		if err := s.monitor.unsubscribe(s); err != nil {
-			utils.Debugf("could not unsubscribe %v (%v)", s, err)
+func (eventState *eventMonitoringState) sendEvent(event *APIEvents) {
+	eventState.RLock()
+	defer eventState.RUnlock()
+	eventState.Add(1)
+	defer eventState.Done()
+	if eventState.isEnabled() {
+		if eventState.noListeners() {
+			eventState.errC <- ErrNoListeners
+			return
 		}
-		s.active = false
-		return nil
-	}
 
-	return fmt.Errorf("unable to close %v", s)
+		for _, listener := range eventState.listeners {
+			listener <- event
+		}
+	}
 }
 
-// run causes the Subscription to start receiving and dispatching Docker container and
-// image lifecycle events.
-func (s *Subscription) run() error {
-	if s.active {
-		return nil
+func (eventState *eventMonitoringState) updateLastSeen(e *APIEvents) {
+	eventState.Lock()
+	defer eventState.Unlock()
+	if atomic.LoadInt64(eventState.lastSeen) < e.Time {
+		atomic.StoreInt64(eventState.lastSeen, e.Time)
 	}
+}
 
-	go func() {
+func (eventState *eventMonitoringState) terminate(err error) {
+	eventState.disableEventMonitoring()
+}
+
+func (c *Client) eventHijack(startTime int64, eventChan chan *APIEvents, errChan chan error) error {
+	uri := "/events"
+	if startTime != 0 {
+		uri += fmt.Sprintf("?since=%d", startTime)
+	}
+	protocol := c.endpointURL.Scheme
+	address := c.endpointURL.Path
+	if protocol != "unix" {
+		protocol = "tcp"
+		address = c.endpointURL.Host
+	}
+	dial, err := net.Dial(protocol, address)
+	if err != nil {
+		return err
+	}
+	conn := httputil.NewClientConn(dial, nil)
+	req, err := http.NewRequest("GET", uri, nil)
+	if err != nil {
+		return err
+	}
+	res, err := conn.Do(req)
+	if err != nil {
+		return err
+	}
+	go func(res *http.Response, conn *httputil.ClientConn) {
+		defer conn.Close()
+		defer res.Body.Close()
+		decoder := json.NewDecoder(res.Body)
 		for {
-			select {
-			case e := <-s.eventChannel:
-				if e["status"] != nil {
-					if h, ok := s.handlers[e["status"].(string)]; ok {
-						h(e)
-					}
+			var event APIEvents
+			if err = decoder.Decode(&event); err != nil {
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
 				}
-			case crc := <-s.cancelChannel:
-				crc <- struct{}{}
-				return
-			case <-s.monitorDone:
-				s.active = false
+				errChan <- err
+			}
+			if event.Time == 0 {
+				continue
+			}
+			if !c.eventMonitor.isEnabled() {
 				return
 			}
+			c.eventMonitor.C <- &event
 		}
-	}()
-
-	s.active = true
+	}(res, conn)
 	return nil
 }
