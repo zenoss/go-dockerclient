@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"time"
 	"sync"
 
 	"github.com/zenoss/go-dockerclient/utils"
