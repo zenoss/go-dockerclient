@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 
 	"github.com/zenoss/go-dockerclient/utils"
@@ -204,7 +205,11 @@ func (em *clientEventMonitor) dispatch(e string) error {
 	// send the event to subscribers interested in everything
 	if subs, ok := em.subscriptions[AllThingsDocker]; ok {
 		for _, sub := range subs {
-			sub.eventChannel <- evt
+			select {
+			case sub.eventChannel <- evt:
+			case <-time.After(time.Second):
+				log.Printf("timeout sending event: %s, %s", evt, sub)
+			}
 		}
 	}
 
@@ -212,7 +217,11 @@ func (em *clientEventMonitor) dispatch(e string) error {
 	if evt["id"] != nil {
 		if subs, ok := em.subscriptions[evt["id"].(string)]; ok {
 			for _, sub := range subs {
-				sub.eventChannel <- evt
+				select {
+				case sub.eventChannel <- evt:
+				case <-time.After(time.Second):
+					log.Printf("timeout sending event: %s, %s", evt, sub)
+				}
 			}
 		}
 	}
