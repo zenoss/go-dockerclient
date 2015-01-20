@@ -303,10 +303,11 @@ func (s *Subscription) run() error {
 			case e := <-s.eventChannel:
 				if e["status"] != nil {
 					s.lock.RLock()
-					if h, ok := s.handlers[e["status"].(string)]; ok {
+					h, ok := s.handlers[e["status"].(string)]
+					s.lock.RUnlock()
+					if ok {
 						h(e)
 					}
-					s.lock.RUnlock()
 				}
 			case crc := <-s.cancelChannel:
 				crc <- struct{}{}
