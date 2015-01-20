@@ -71,6 +71,7 @@ type Subscription struct {
 	monitorDone   chan struct{}
 	handlers      map[string]HandlerFunc
 	monitor       *clientEventMonitor
+	lock          sync.RWMutex
 }
 
 // eventMonitor is used by the client to monitor Docker lifecycle events
@@ -150,6 +151,7 @@ func (em *clientEventMonitor) Subscribe(ID string) (*Subscription, error) {
 		monitorDone:   em.done,
 		handlers:      make(map[string]HandlerFunc),
 		monitor:       em,
+		lock:          sync.RWMutex{},
 	}
 
 	em.subscriptions[ID] = append(em.subscriptions[ID], s)
@@ -270,7 +272,9 @@ func (s *Subscription) Handle(es string, h HandlerFunc) error {
 		return fmt.Errorf("unknown event: %s", es)
 	}
 
+	s.lock.Lock()
 	s.handlers[es] = h
+	s.lock.Unlock()
 	return nil
 }
 
@@ -308,7 +312,10 @@ func (s *Subscription) run() error {
 			select {
 			case e := <-s.eventChannel:
 				if e["status"] != nil {
-					if h, ok := s.handlers[e["status"].(string)]; ok {
+					s.lock.RLock()
+					h, ok := s.handlers[e["status"].(string)]
+					s.lock.RUnlock()
+					if ok {
 						h(e)
 					}
 				}
