@@ -294,7 +294,7 @@ func (c *Client) BuildImage(opts BuildImageOptions) error {
 // TagImageOptions present the set of options to tag an image
 type TagImageOptions struct {
 	Repo  string `qs:"repo"`
-	Force bool   `qs:"force"`
+	Force bool   `qs:"force,omitempty"`
 	Tag   string `qs:"tag"`
 }
 
