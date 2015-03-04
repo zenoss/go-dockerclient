@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -257,6 +258,31 @@ func (c *Client) ImportImage(opts ImportImageOptions) error {
 		opts.Source = "-"
 	}
 	return c.createImage(queryString(&opts), nil, opts.InputStream, opts.OutputStream)
+}
+
+// ExportImageOptions is the set of parameters to the ExportImage
+// method.
+//
+// See http://goo.gl/Lqk0FZ for more details.
+type ExportImageOptions struct {
+	Names        []string
+	OutputStream io.Writer
+}
+
+// ExportImages gets a tarball containing all images and metadata from the
+// repository specified.
+//
+// See http://goo.gl/PhBKnS for more details.
+func (c *Client) ExportImages(opts ExportImageOptions) error {
+	if opts.Names == nil {
+		return ErrNoSuchImage
+	}
+	names := make([]string, len(opts.Names))
+	for i, name := range opts.Names {
+		names[i] = fmt.Sprintf("names=%s", name)
+	}
+	url := fmt.Sprintf("/images/get?%s", strings.Join(names, "&"))
+	return c.stream("GET", url, nil, nil, opts.OutputStream)
 }
 
 // BuildImageOptions present the set of informations available for building
