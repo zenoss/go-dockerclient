@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -276,7 +277,12 @@ func (c *Client) SaveImages(opts SaveImageOptions) error {
 	if opts.Names == nil {
 		return ErrNoSuchImage
 	}
-	url := fmt.Sprintf("/images/get?%s", queryString(&opts))
+	names := make([]string, len(opts.Names))
+	for i, name := range opts.Names {
+		names[i] = fmt.Sprintf("names=%s", name)
+	}
+	qs := strings.Join(names, "&")
+	url := fmt.Sprintf("/images/get?%s", qs)
 	return c.stream("GET", url, nil, nil, opts.OutputStream)
 }
 
