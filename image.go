@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strings"
 	"time"
 )
 
@@ -260,29 +259,33 @@ func (c *Client) ImportImage(opts ImportImageOptions) error {
 	return c.createImage(queryString(&opts), nil, opts.InputStream, opts.OutputStream)
 }
 
-// ExportImageOptions is the set of parameters to the ExportImage
+// SaveImageOptions is the set of parameters to the SaveImages
 // method.
 //
 // See http://goo.gl/Lqk0FZ for more details.
-type ExportImageOptions struct {
-	Names        []string
-	OutputStream io.Writer
+type SaveImageOptions struct {
+	Names        []string  `qs:"names"`
+	OutputStream io.Writer `qs:"-"`
 }
 
-// ExportImages gets a tarball containing all images and metadata from the
+// SaveImages gets a tarball containing all images and metadata from the
 // repository specified.
 //
 // See http://goo.gl/PhBKnS for more details.
-func (c *Client) ExportImages(opts ExportImageOptions) error {
+func (c *Client) SaveImages(opts SaveImageOptions) error {
 	if opts.Names == nil {
 		return ErrNoSuchImage
 	}
-	names := make([]string, len(opts.Names))
-	for i, name := range opts.Names {
-		names[i] = fmt.Sprintf("names=%s", name)
-	}
-	url := fmt.Sprintf("/images/get?%s", strings.Join(names, "&"))
+	url := fmt.Sprintf("/images/get?%s", queryString(&opts))
 	return c.stream("GET", url, nil, nil, opts.OutputStream)
+}
+
+// LoadImages loads tarball with a set of images and tags into docker
+//
+// See http://goo.gl/Lqk0FZ for more details.
+func (c *Client) LoadImages(inputStream io.Reader) error {
+	url := "/images/load"
+	return c.stream("POST", url, nil, inputStream, nil)
 }
 
 // BuildImageOptions present the set of informations available for building
